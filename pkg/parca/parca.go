@@ -319,8 +319,7 @@ func Run(ctx context.Context, logger log.Logger, reg *prometheus.Registry, flags
 			partitionSpec := iceberg.NewPartitionSpec(
 				iceberg.PartitionField{
 					Name:      profile.ColumnTimestamp,
-					Transform: iceberg.DayTransform{}, // Partition by day for efficient time range queries
-					SourceID:  1000,                   // Ensure we use the timestamp field for partitioning
+					Transform: iceberg.DayTransform{},
 				},
 			)
 
@@ -334,13 +333,11 @@ func Run(ctx context.Context, logger log.Logger, reg *prometheus.Registry, flags
 					return err
 				}
 			case "glue":
-				// Get region from flags only
 				region := defaultIcebergGlueRegion
 				if flags.Hidden.IcebergAWSGlueRegion != "" {
 					region = flags.Hidden.IcebergAWSGlueRegion
 				}
 
-				// Get optional catalog ID from flags only
 				catalogID := ""
 				if flags.Hidden.IcebergAWSGlueCatalogID != "" {
 					catalogID = flags.Hidden.IcebergAWSGlueCatalogID
