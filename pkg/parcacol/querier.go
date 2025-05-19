@@ -359,6 +359,20 @@ func (q *Querier) QueryRange(
 		step = time.Second
 	}
 
+	// Calculate bucket size in milliseconds for timestamp bucketing
+	bucketSizeMillis := int64(step.Seconds() * 1000)
+
+	// Create timestamp bucket expression for more efficient filtering
+	// This will align timestamps to bucket boundaries for better data reduction
+	timestampBucketExpr := logicalplan.Mul(
+		logicalplan.Div(
+			logicalplan.Col(profile.ColumnTimestamp),
+			logicalplan.Literal(bucketSizeMillis),
+		),
+		logicalplan.Literal(bucketSizeMillis),
+	).Alias("timestamp_bucket")
+
+	// Create filter expressions including the original selectors and time range
 	exprs := append(
 		selectorExprs,
 		logicalplan.Col(profile.ColumnTimestamp).Gt(logicalplan.Literal(start)),
@@ -371,13 +385,14 @@ func (q *Querier) QueryRange(
 		return q.queryRangeDelta(
 			ctx,
 			filterExpr,
+			timestampBucketExpr,
 			step,
 			queryParts.Meta,
 			sumBy,
 		)
 	}
 
-	return q.queryRangeNonDelta(ctx, filterExpr, step, sumBy)
+	return q.queryRangeNonDelta(ctx, filterExpr, timestampBucketExpr, step, sumBy)
 }
 
 const (
@@ -388,6 +403,7 @@ const (
 func (q *Querier) queryRangeDelta(
 	ctx context.Context,
 	filterExpr logicalplan.Expr,
+	timestampBucketExpr logicalplan.Expr,
 	step time.Duration,
 	m profile.Meta,
 	sumBy []string,
@@ -408,13 +424,7 @@ func (q *Querier) queryRangeDelta(
 	timestampUnique := logicalplan.Unique(logicalplan.Col(profile.ColumnTimestamp))
 
 	preProjection := []logicalplan.Expr{
-		logicalplan.Mul(
-			logicalplan.Div(
-				logicalplan.Col(profile.ColumnTimestamp),
-				logicalplan.Literal(step.Milliseconds()),
-			),
-			logicalplan.Literal(step.Milliseconds()),
-		).Alias(TimestampBucket),
+		timestampBucketExpr,
 		logicalplan.Col(profile.ColumnTimestamp),
 		logicalplan.DynCol(profile.ColumnLabels),
 		logicalplan.Col(profile.ColumnDuration),
@@ -638,7 +648,14 @@ func getSumByAggregateExprs(sumBy []string) []logicalplan.Expr {
 	return exprs
 }
 
-func (q *Querier) queryRangeNonDelta(ctx context.Context, filterExpr logicalplan.Expr, step time.Duration, sumBy []string) ([]*pb.MetricsSeries, error) {
+func (q *Querier) queryRangeNonDelta(
+	ctx context.Context,
+	filterExpr logicalplan.Expr,
+	timestampBucketExpr logicalplan.Expr,
+	step time.Duration,
+	sumBy []string,
+) ([]*pb.MetricsSeries, error) {
+	// Track records to be released at the end
 	records := []arrow.Record{}
 	defer func() {
 		for _, r := range records {
@@ -647,25 +664,49 @@ func (q *Querier) queryRangeNonDelta(ctx context.Context, filterExpr logicalplan
 	}()
 	rows := 0
 
+	// Calculate the sum of values per bucket
 	valueSum := logicalplan.Sum(logicalplan.Col(profile.ColumnValue))
 	valueSumColumn := valueSum.Name()
-	err := q.engine.ScanTable(q.tableName).
-		Filter(filterExpr).
-		Aggregate(
-			[]*logicalplan.AggregationFunction{
-				valueSum,
-			},
-			[]logicalplan.Expr{
-				logicalplan.Col(profile.ColumnTimestamp),
-				logicalplan.DynCol(profile.ColumnLabels),
-			},
-		).
-		Execute(ctx, func(ctx context.Context, r arrow.Record) error {
-			r.Retain()
-			records = append(records, r)
-			rows += int(r.NumRows())
-			return nil
-		})
+
+	// Execute query with timestamp bucketing at the database level
+	// First project the necessary columns including the bucket calculation
+	builder := q.engine.ScanTable(q.tableName).
+		Filter(filterExpr)
+
+	// Project the timestamp bucket and other necessary columns
+	builder = builder.Project(
+		timestampBucketExpr,
+		logicalplan.Col(profile.ColumnValue),
+		logicalplan.DynCol(profile.ColumnLabels),
+	)
+
+	// Group by timestamp bucket and labels, and aggregate values within each bucket
+	aggregations := []*logicalplan.AggregationFunction{valueSum}
+
+	// Create group by expressions including timestamp bucket
+	groupByColumns := []logicalplan.Expr{logicalplan.Col("timestamp_bucket")}
+
+	// Add the sum_by labels to the group by clause if provided
+	if len(sumBy) > 0 {
+		for _, label := range sumBy {
+			groupByColumns = append(groupByColumns, logicalplan.Col(profile.ColumnLabelsPrefix+label))
+		}
+	} else {
+		// If no sum_by labels provided, group by all labels to maintain series separation
+		groupByColumns = append(groupByColumns, logicalplan.DynCol(profile.ColumnLabels))
+	}
+
+	// Execute the query with aggregation
+	err := builder.Aggregate(
+		aggregations,
+		groupByColumns,
+	).Execute(ctx, func(ctx context.Context, r arrow.Record) error {
+		r.Retain()
+		records = append(records, r)
+		rows += int(r.NumRows())
+		return nil
+	})
+
 	if err != nil {
 		return nil, err
 	}
@@ -680,15 +721,15 @@ func (q *Querier) queryRangeNonDelta(ctx context.Context, filterExpr logicalplan
 		index int
 		found bool
 	}
-	// Add necessary columns and their found value is false by default.
+
+	// Add necessary columns and their found value is false by default
 	columnIndices := map[string]columnIndex{
-		profile.ColumnTimestamp: {},
-		valueSumColumn:          {},
+		"timestamp_bucket": {},
+		valueSumColumn:     {},
 	}
 	labelColumnIndices := []int{}
 	labelSet := labels.Labels{}
 	resSeries := []*pb.MetricsSeries{}
-	resSeriesBuckets := map[int]map[int64]struct{}{}
 	labelsetToIndex := map[string]int{}
 
 	for _, ar := range records {
@@ -741,39 +782,23 @@ func (q *Querier) queryRangeNonDelta(ctx context.Context, filterExpr logicalplan
 				resSeries = append(resSeries, &pb.MetricsSeries{Labelset: &profilestorepb.LabelSet{Labels: pbLabelSet}})
 				index = len(resSeries) - 1
 				labelsetToIndex[s] = index
-				resSeriesBuckets[index] = map[int64]struct{}{}
 			}
 
-			ts := ar.Column(columnIndices[profile.ColumnTimestamp].index).(*array.Int64).Value(i)
+			// Get the timestamp bucket value (bucket start time)
+			bucketTs := ar.Column(columnIndices["timestamp_bucket"].index).(*array.Int64).Value(i)
 			value := ar.Column(columnIndices[valueSumColumn].index).(*array.Int64).Value(i)
-
-			// Each step bucket will only return one of the timestamps and its value.
-			// For this reason we'll take each timestamp and divide it by the step seconds.
-			// If we have seen a MetricsSample for this bucket before, we'll ignore this one.
-			// If we haven't seen one we'll add this sample to the response.
-
-			// TODO: This still queries way too much data from the underlying database.
-			// This needs to be moved to FrostDB to not even query all of this data in the first place.
-			// With a scrape interval of 10s and a query range of 1d we'd query 8640 samples and at most return 960.
-			// Even worse for a week, we'd query 60480 samples and only return 1000.
-			tsBucket := ts / 1000 / int64(step.Seconds())
-			if _, found := resSeriesBuckets[index][tsBucket]; found {
-				// We already have a MetricsSample for this timestamp bucket, ignore it.
-				continue
-			}
 
 			series := resSeries[index]
 			series.Samples = append(series.Samples, &pb.MetricsSample{
-				Timestamp:      timestamppb.New(timestamp.Time(ts)),
+				// Use the bucket timestamp
+				Timestamp:      timestamppb.New(timestamp.Time(bucketTs)),
 				Value:          value,
 				ValuePerSecond: float64(value),
 			})
-			// Mark the timestamp bucket as filled by the above MetricsSample.
-			resSeriesBuckets[index][tsBucket] = struct{}{}
 		}
 	}
 
-	// This is horrible and should be fixed. The data is sorted in the storage, we should not have to sort it here.
+	// Sort samples by timestamp
 	for _, series := range resSeries {
 		sort.Slice(series.Samples, func(i, j int) bool {
 			return series.Samples[i].Timestamp.AsTime().Before(series.Samples[j].Timestamp.AsTime())

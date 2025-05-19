@@ -89,6 +89,13 @@ const (
 	flagModeScraperOnly   = "scraper-only"
 	flagModeForwarder     = "forwarder"
 	metaStoreBadger       = "badger"
+
+	// Default Iceberg configuration values
+	defaultIcebergCatalogType   = "hdfs"
+	defaultIcebergGlueRegion    = "us-east-1"
+	defaultIcebergGlueDatabase  = "parca"
+	defaultIcebergGlueTable     = "profiles"
+	icebergCatalogTypeConfigKey = "iceberg_catalog_type"
 )
 
 type Flags struct {
@@ -176,7 +183,10 @@ type FlagsHidden struct {
 	DebugNormalizeAddresses bool `kong:"help='Normalize sampled addresses.',default='true',hidden=''"`
 
 	// IcebergStorage is a experimental feature that enables Apache Iceberg storage for profile storage. This can be used with the enable-persistence flag.
-	IcebergStorage bool `kong:"help='Use iceberg storage for profile storage. Requires enable-persistence flag.',default='false',hidden=''"`
+	IcebergStorage          bool   `kong:"help='Use iceberg storage for profile storage. Requires enable-persistence flag.',default='false',hidden=''"`
+	IcebergCatalogType      string `kong:"help='Catalog type to use for Iceberg storage. Supported values: hdfs, glue',default='hdfs',hidden=''"`
+	IcebergAWSGlueRegion    string `kong:"help='AWS region for the Glue catalog',default='us-east-1',hidden=''"`
+	IcebergAWSGlueCatalogID string `kong:"help='AWS Glue catalog ID. If not specified, the default AWS account ID will be used.',default='',hidden=''"`
 }
 
 // Run the parca server.
@@ -291,25 +301,73 @@ func Run(ctx context.Context, logger log.Logger, reg *prometheus.Registry, flags
 		prefixedBucket := objstore.NewPrefixedBucket(bucket, blocksDirectory)
 		var store frostdb.DataSinkSource
 		if flags.Hidden.IcebergStorage { // Experimental Iceberg storage.
-			// Optain the bucket URI from the config
+			// Obtain the bucket URI from the config
 			uri, err := BucketURIFromConfig(bucketCfg)
 			if err != nil {
 				level.Error(logger).Log("msg", "failed to get bucket URI from config", "err", err)
 				return err
 			}
 			path := filepath.Join(uri, blocksDirectory)
-			store, err = storage.NewIceberg(path, catalog.NewHDFS(path, prefixedBucket), prefixedBucket,
-				storage.WithIcebergPartitionSpec(
-					iceberg.NewPartitionSpec( // Partition the table by timestamp.
-						iceberg.PartitionField{
-							Name:      profile.ColumnTimestamp,
-							Transform: iceberg.IdentityTransform{},
-						},
-					),
-				))
-			if err != nil {
-				level.Error(logger).Log("msg", "failed to initialize iceberg", "err", err)
-				return err
+
+			catalogType := defaultIcebergCatalogType
+			if flags.Hidden.IcebergCatalogType != "" {
+				catalogType = strings.ToLower(flags.Hidden.IcebergCatalogType)
+			}
+
+			// Create partition spec to use with any catalog type
+			// Partition by timestamp bucketed by day for efficient time range queries
+			partitionSpec := iceberg.NewPartitionSpec(
+				iceberg.PartitionField{
+					Name:      profile.ColumnTimestamp,
+					Transform: iceberg.DayTransform{}, // Partition by day for efficient time range queries
+					SourceID:  1000,                   // Ensure we use the timestamp field for partitioning
+				},
+			)
+
+			switch catalogType {
+			case "hdfs":
+				store, err = storage.NewIceberg(path, catalog.NewHDFS(path, prefixedBucket), prefixedBucket,
+					storage.WithIcebergPartitionSpec(partitionSpec),
+				)
+				if err != nil {
+					level.Error(logger).Log("msg", "failed to initialize iceberg", "err", err)
+					return err
+				}
+			case "glue":
+				// Get region from flags only
+				region := defaultIcebergGlueRegion
+				if flags.Hidden.IcebergAWSGlueRegion != "" {
+					region = flags.Hidden.IcebergAWSGlueRegion
+				}
+
+				// Get optional catalog ID from flags only
+				catalogID := ""
+				if flags.Hidden.IcebergAWSGlueCatalogID != "" {
+					catalogID = flags.Hidden.IcebergAWSGlueCatalogID
+				}
+
+				// Create minimal properties for the Glue catalog
+				catalogProps := iceberg.Properties{
+					"database": defaultIcebergGlueDatabase,
+					"table":    defaultIcebergGlueTable,
+				}
+
+				level.Info(logger).Log("msg", "initializing AWS Glue catalog", "region", region)
+
+				// Create Glue catalog and initialize Iceberg store
+				glueCatalog, err := catalog.NewGlue(region, catalogID, prefixedBucket, catalogProps)
+				if err != nil {
+					return fmt.Errorf("failed to create AWS Glue catalog: %w", err)
+				}
+
+				store, err = storage.NewIceberg(path, glueCatalog, prefixedBucket,
+					storage.WithIcebergPartitionSpec(partitionSpec),
+				)
+				if err != nil {
+					return fmt.Errorf("failed to initialize Iceberg with AWS Glue catalog: %w", err)
+				}
+			default:
+				return fmt.Errorf("unknown Iceberg catalog type: %s", catalogType)
 			}
 		} else {
 			store = frostdb.NewDefaultObjstoreBucket(prefixedBucket)
