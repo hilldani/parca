@@ -261,3 +261,5 @@ require (
 )
 
 replace github.com/polarsignals/iceberg-go => /Users/daniel.hill/iceberg-go
+
+replace github.com/polarsignals/frostdb => /Users/daniel.hill/frostdb
